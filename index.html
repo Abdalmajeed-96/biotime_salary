@@ -1,0 +1,347 @@
+<!doctype html>
+<html>
+<head>
+    <title>Time Card Summary</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    
+    <style>
+        table, td, th { border: 1px solid #000; border-collapse: collapse; padding: 6px }
+        input[type=number] { width: 60px }
+        /* Style for the new button */
+        #downloadBtn {
+            display: none; /* Hidden by default */
+            margin-top: 15px;
+            padding: 8px 12px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <h2>Make a table based on JSON data.</h2>
+    <form id="uploadForm">
+        <input id="fileInput" name="file" type="file" accept=".xlsx, .xls, .csv"> 
+        <button type="submit">Upload</button>
+    </form>
+    
+    <table id="timeTable"></table>
+    <br>
+    <table id="summaryTable"></table>
+    
+    <button id="downloadBtn">Download Summary (CSV)</button>
+
+<script>
+    // IndexedDB setup (Unchanged)
+    let db;
+    const request = indexedDB.open("PEHDatabase", 1);
+    request.onupgradeneeded = e => {
+        db = e.target.result;
+        db.createObjectStore("pehStore", { keyPath: "key" });
+    };
+    request.onsuccess = e => { db = e.target.result; };
+    request.onerror = e => { console.error("IndexedDB error:", e.target.errorCode); };
+
+    // savePEHToDB (Unchanged)
+    function savePEHToDB(key, value) {
+        const transaction = db.transaction(["pehStore"], "readwrite");
+        transaction.objectStore("pehStore").put({ key: key, value: value });
+    }
+
+    // loadPEHFromDB (Unchanged)
+    function loadPEHFromDB(key, callback) {
+        const request = db.transaction(["pehStore"], "readonly").objectStore("pehStore").get(key);
+        request.onsuccess = () => {
+            callback(request.result ? request.result.value : null);
+        };
+        request.onerror = () => { callback(null); };
+    }
+
+    // calculateTotalTime (MODIFIED)
+    function calculateTotalTime(timeStr) {
+        if (!timeStr) return 0;
+        // --- MODIFICATION 1: Changed split from comma (',') to semicolon (';') ---
+        const times = timeStr.split(';');
+        // --- End of MODIFICATION 1 ---
+        
+        let totalMilliseconds = 0;
+        for (let i = 0; i < times.length - 1; i += 2) {
+            if (!times[i] || !times[i+1]) continue;
+            const [inH, inM, inS] = times[i].split(':').map(Number);
+            const [outH, outM, outS] = times[i + 1].split(':').map(Number);
+            if (isNaN(inH) || isNaN(outH)) continue;
+            const inSeconds = (inH * 3600) + (inM * 60) + (inS || 0);
+            const outSeconds = (outH * 3600) + (outM * 60) + (outS || 0);
+            const durationSeconds = outSeconds - inSeconds;
+            if (durationSeconds > 0) {
+                    totalMilliseconds += durationSeconds * 1000;
+            }
+        }
+        return totalMilliseconds;
+    }
+
+    // formatDuration (Unchanged)
+    function formatDuration(ms) {
+        const totalSeconds = Math.floor(ms / 1000);
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
+
+    // Submit listener (Unchanged)
+    // Note: The XLSX library can parse CSVs, so no change is needed here.
+    document.getElementById('uploadForm').addEventListener('submit', (event) => {
+        event.preventDefault();
+        const file = document.getElementById('fileInput').files[0];
+        if (!file) {
+            alert('Please select a file to upload.');
+            return;
+        }
+        const reader = new FileReader();
+        reader.onload = function (e) {
+            try {
+                const data = e.target.result;
+                const workbook = XLSX.read(data, { type: 'binary' });
+                const sheetName = workbook.SheetNames[0];
+                const worksheet = workbook.Sheets[sheetName];
+                const data_aoa = XLSX.utils.sheet_to_json(worksheet, { 
+                    header: 1, 
+                    defval: "",
+                    raw: false 
+                });
+                const customJson = convertAoaToCustomJson(data_aoa);
+                createTable(customJson);
+            } catch (error) {
+                console.error('Error processing file:', error);
+                alert('An error occurred while processing the file. Make sure it is a valid spreadsheet.');
+            }
+        };
+        reader.onerror = (ex) => { console.error('Error reading file:', ex); };
+        reader.readAsBinaryString(file);
+    });
+
+    // convertAoaToCustomJson (Unchanged)
+    function convertAoaToCustomJson(aoa) {
+        const customData = {};
+        const colLetters = [];
+        for (let i = 0; i < 26; i++) {
+            colLetters.push(String.fromCharCode(65 + i));
+        }
+        aoa.forEach((rowArray, rowIndex) => {
+            const rowNum = rowIndex + 1;
+            const rowObj = {};
+            rowArray.forEach((cellValue, colIndex) => {
+                if (colIndex < colLetters.length) {
+                    rowObj[colLetters[colIndex]] = cellValue;
+                }
+            });
+            customData[rowNum] = rowObj;
+        });
+        return customData;
+    }
+
+    // createTable function (MODIFIED)
+    function createTable(data) {
+        const table = document.getElementById("timeTable");
+        table.innerHTML = "";
+
+        // --- MODIFICATION 2: Check for headers on row "1" instead of "2" ---
+        if (!data || Object.keys(data).length === 0 || !data["1"]) {
+            table.innerHTML = "<tr><td>No data available or invalid file format. (Headers not found on row 1)</td></tr>";
+        // --- End of MODIFICATION 2 ---
+            return;
+        }
+
+        // --- Create header row (MODIFIED) ---
+        const headerRow = document.createElement("tr");
+        // --- MODIFICATION 3: Get headers from row "1" instead of "2" ---
+        const headers = Object.values(data["1"]);
+        // --- End of MODIFICATION 3 ---
+        headers.push("Work");
+        headers.forEach(header => {
+            const th = document.createElement("th");
+            th.textContent = header;
+            headerRow.appendChild(th);
+        });
+        table.appendChild(headerRow);
+
+        const summary = {};
+
+        // --- Process data rows (MODIFIED) ---
+        Object.keys(data).forEach(key => {
+            // --- MODIFICATION 4: Start processing data from row "2" instead of "3" ---
+            if (parseInt(key) >= 2) {
+            // --- End of MODIFICATION 4 ---
+                const row = data[key];
+                if (!row || !row["A"]) return;
+                
+                const tr = document.createElement("tr");
+                ["A", "B", "C", "D", "E", "F"].forEach(col => {
+                    const td = document.createElement("td");
+                    td.textContent = row[col];
+                    tr.appendChild(td);
+                });
+
+                const workMs = calculateTotalTime(row["F"]);
+                const workFormatted = formatDuration(workMs);
+                const workTd = document.createElement("td");
+                workTd.textContent = workFormatted;
+                tr.appendChild(workTd);
+                table.appendChild(tr);
+
+                const id = row["A"];
+                if (!summary[id]) {
+                    summary[id] = {
+                        id: row["A"],
+                        name: row["B"],
+                        dept: row["C"],
+                        totalMs: 0,
+                        days: 0
+                    };
+                }
+                summary[id].totalMs += workMs;
+                summary[id].days += 1;
+            }
+        });
+
+        // --- Create summary table (Unchanged) ---
+        const summaryTable = document.getElementById("summaryTable");
+        summaryTable.innerHTML = "";
+
+        const summaryHeader = document.createElement("tr");
+        ["Employee ID", "First Name", "Department", "Total Hours", "Workdays", "PE/H", "Salary"].forEach(h => {
+            const th = document.createElement("th");
+            th.textContent = h;
+            summaryHeader.appendChild(th);
+        });
+        summaryTable.appendChild(summaryHeader);
+
+        for (let id in summary) {
+            const s = summary[id];
+            const totalHours = s.totalMs / (1000 * 60 * 60);
+            const workdays = (totalHours / 9).toFixed(2);
+            const key = `${s.id}_${s.name}`;
+            let defaultPEH = 3.5;
+            let salary = (totalHours * defaultPEH).toFixed(2);
+            const tr = document.createElement("tr");
+            [s.id, s.name, s.dept, totalHours.toFixed(2), workdays].forEach(val => {
+                const td = document.createElement("td");
+                td.textContent = val;
+                tr.appendChild(td);
+            });
+            const pehTd = document.createElement("td");
+            const pehInput = document.createElement("input");
+            pehInput.type = "number";
+            pehInput.step = "0.1";
+            pehInput.style.width = "60px";
+            const salaryTd = document.createElement("td");
+            salaryTd.textContent = salary;
+            loadPEHFromDB(key, (savedPEH) => {
+                const pehValue = savedPEH !== null ? savedPEH : defaultPEH;
+                pehInput.value = pehValue;
+                salaryTd.textContent = (totalHours * pehValue).toFixed(2);
+            });
+            pehInput.addEventListener("input", () => {
+                const newPEH = parseFloat(pehInput.value);
+                if (!isNaN(newPEH)) {
+                    savePEHToDB(key, newPEH);
+                    salaryTd.textContent = (totalHours * newPEH).toFixed(2);
+                } else {
+                    salaryTd.textContent = "NaN";
+                }
+            });
+            pehTd.appendChild(pehInput);
+            tr.appendChild(pehTd);
+            tr.appendChild(salaryTd);
+            summaryTable.appendChild(tr);
+        }
+        
+        // --- Show and setup download button (Unchanged) ---
+        const downloadBtn = document.getElementById('downloadBtn');
+        if (Object.keys(summary).length > 0) {
+            downloadBtn.style.display = 'block'; // Show the button
+            
+            // Clone and replace button to remove any old listeners
+            const newBtn = downloadBtn.cloneNode(true);
+            downloadBtn.parentNode.replaceChild(newBtn, downloadBtn);
+            
+            // Add click listener to the new button
+            newBtn.addEventListener('click', () => {
+                downloadSummaryTable('summaryTable', 'time-card-summary.csv');
+            });
+        } else {
+            downloadBtn.style.display = 'none'; // Hide if no summary
+        }
+    } // --- END of createTable function ---
+
+
+    // --- Added new helper functions for downloading (Unchanged) ---
+    
+    /**
+     * Gathers data from the summary table and triggers a CSV download.
+     * @param {string} tableId - The ID of the table to download.
+     * @param {string} filename - The desired filename for the download.
+     */
+    function downloadSummaryTable(tableId, filename) {
+        const table = document.getElementById(tableId);
+        if (!table) {
+            console.error('Table not found!');
+            return;
+        }
+
+        let csv = [];
+        const rows = table.querySelectorAll("tr");
+        
+        for (const row of rows) {
+            let rowData = [];
+            // Get both headers (th) and data cells (td)
+            const cells = row.querySelectorAll("th, td");
+            
+            for (const cell of cells) {
+                let cellData;
+                const input = cell.querySelector('input');
+                
+                if (input) {
+                    // Get current value from input field
+                    cellData = input.value;
+                } else {
+                    // Get text from regular cell
+                    cellData = cell.textContent;
+                }
+                
+                // Escape cell data for CSV format
+                cellData = cellData.replace(/"/g, '""'); // Escape double quotes
+                if (cellData.includes(',') || cellData.includes('\n') || cellData.includes('"')) {
+                    cellData = `"${cellData}"`; // Wrap in double quotes if needed
+                }
+                rowData.push(cellData);
+            }
+            csv.push(rowData.join(","));
+        }
+        
+        // Trigger the download
+        downloadCSV(csv.join("\n"), filename);
+    }
+
+    /**
+     * Creates a temporary link to download a CSV file from a string.
+     * @param {string} csvContent - The CSV data as a single string.
+     * @param {string} filename - The desired filename.
+     */
+    function downloadCSV(csvContent, filename) {
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement("a");
+        
+        const url = URL.createObjectURL(blob);
+        link.setAttribute("href", url);
+        link.setAttribute("download", filename);
+        link.style.visibility = 'hidden';
+        
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+    }
+</script>
+</body>
+</html>
