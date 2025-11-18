@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Time Card Summary</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 20px;
+            background-color: #f9f9f9;
+        }
+
+        h2 {
+            color: #333;
+        }
+
+        input[type="file"] {
+            margin-bottom: 20px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            background-color: #fff;
+        }
+
+        th,
+        td {
+            border: 1px solid #ddd;
+            padding: 10px;
+            text-align: left;
+        }
+
+        th {
+            background-color: #f2f2f2;
+            color: #555;
+        }
+
+        tbody tr:nth-child(even) {
+            background-color: #fcfcfc;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h2>Time Card Summary Report</h2>
+    <p>Upload your CSV or XLSX time card file. The summary will be generated below.</p>
+
+    <input type="file" id="fileInput" accept=".csv, .xlsx, .xls">
+
+    <div id="shiftSettings"
+        style="display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 20px; background: #fff; padding: 15px; border-radius: 5px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+        <div>
+            <label for="morningLateThreshold" style="display: block; font-weight: 500; font-size: 14px;">Morning Late
+                After:</label>
+            <input type="time" id="morningLateThreshold" value="07:15" style="padding: 5px;">
+        </div>
+        <div>
+            <label for="morningEnd" style="display: block; font-weight: 500; font-size: 14px;">Morning End:</label>
+            <input type="time" id="morningEnd" value="12:30" style="padding: 5px;">
+        </div>
+        <div>
+            <label for="afternoonLateThreshold" style="display: block; font-weight: 500; font-size: 14px;">Afternoon
+                Late After:</label>
+            <input type="time" id="afternoonLateThreshold" value="16:15" style="padding: 5px;">
+        </div>
+        <div>
+            <label for="afternoonEnd" style="display: block; font-weight: 500; font-size: 14px;">Afternoon End:</label>
+            <input type="time" id="afternoonEnd" value="19:30" style="padding: 5px;">
+        </div>
+    </div>
+    <div id="summaryTableContainer">
+        <table id="summaryTable"></table>
+    </div>
+
+    <script>
+    document.getElementById('fileInput').addEventListener('change', handleFile);
+
+    function getImportantPunches(punchStr) {
+        // Convert "HH:MM:SS" to minutes since midnight
+        const toMinutes = t => {
+            const [h, m, s] = t.split(":").map(Number);
+            return h * 60 + m;
+        };
+
+        // Convert back to HH:MM:SS
+        const toTime = mins => {
+            const h = String(Math.floor(mins / 60)).padStart(2, "0");
+            const m = String(mins % 60).padStart(2, "0");
+            return `${h}:${m}:00`;
+        };
+
+        // Remove duplicates
+        const punches = [...new Set(punchStr.split(";"))].map(toMinutes).sort((a, b) => a - b);
+
+        // Define schedule windows
+        const morningStartMin = 7 * 60;       // 07:00
+        const morningStartMax = 7 * 60 + 15;  // 07:15
+        const morningLeave = 12 * 60 + 30; // 12:30
+
+        const afternoonStartMin = 16 * 60;       // 16:00
+        const afternoonStartMax = 16 * 60 + 15;  // 16:15
+        const afternoonLeave = 19 * 60 + 30;  // 19:30
+
+        // Find punches in the right windows
+        const morningIn = punches.find(p => p >= morningStartMin && p <= morningStartMax);
+        const morningOut = punches.find(p => Math.abs(p - morningLeave) <= 15); // ±15 min tolerance
+        const afternoonIn = punches.find(p => p >= afternoonStartMin && p <= afternoonStartMax);
+        const afternoonOut = punches.find(p => p >= afternoonStartMax && p <= afternoonLeave);
+
+        // Collect only if they exist
+        const result = [];
+        if (morningIn) result.push(toTime(morningIn));
+        if (morningOut) result.push(toTime(morningOut));
+        if (afternoonIn) result.push(toTime(afternoonIn));
+        if (afternoonOut) result.push(toTime(afternoonOut));
+
+        return result;
+    }
+
+    function getShiftPunches(punchStr) {
+        // Parse times into minutes since midnight
+        const toMinutes = t => {
+            const [h, m, s] = t.split(":").map(Number);
+            return h * 60 + m + s / 60;
+        };
+        const toTime = mins => {
+            const h = String(Math.floor(mins / 60)).padStart(2, "0");
+            const m = String(Math.floor(mins % 60)).padStart(2, "0");
+            const s = "00";
+            return `${h}:${m}:${s}`;
+        };
+
+        // Deduplicate and sort
+        const punches = [...new Set(punchStr.split(";"))]
+            .map(toMinutes)
+            .sort((a, b) => a - b);
+
+        if (punches.length === 0) return [];
+
+        // Strategy:
+        // - First punch = shift start
+        // - Last punch = shift end
+        // - If there is a long gap (> 2 hours) between punches, treat as break
+        //   -> take last before gap as "morning out"
+        //   -> first after gap as "afternoon in"
+
+        const result = [punches[0]]; // first punch
+        let breakOut = null, breakIn = null;
+
+        for (let i = 0; i < punches.length - 1; i++) {
+            const gap = punches[i + 1] - punches[i];
+            if (gap >= 120) { // 2 hours or more = break
+                breakOut = punches[i];
+                breakIn = punches[i + 1];
+                break;
+            }
+        }
+
+        if (breakOut && breakIn) {
+            result.push(breakOut);
+            result.push(breakIn);
+        }
+
+        result.push(punches[punches.length - 1]); // last punch
+        console.log(result.map(toTime));
+        // Convert back to HH:MM:SS
+        return result.map(toTime);
+    }
+    /**
+     * Reads the shift time settings from the UI inputs.
+     * @returns {object} The SHIFTS configuration object.
+     */
+    function getShiftSettings() {
+        // 1. Get values from the UI, providing defaults
+        const mLate = document.getElementById('morningLateThreshold').value || '07:15';
+        const mEnd = document.getElementById('morningEnd').value || '12:30';
+        const aLate = document.getElementById('afternoonLateThreshold').value || '16:15';
+        const aEnd = document.getElementById('afternoonEnd').value || '19:30';
+
+        // 2. Return in the same structure as the old static object
+        // We append ":00" because <input type="time"> returns "HH:MM"
+        // but your functions expect "HH:MM:SS"
+        return {
+            MORNING: {
+                LATE_THRESHOLD: mLate + ':00',
+                END: mEnd + ':00'
+            },
+            AFTERNOON: {
+                LATE_THRESHOLD: aLate + ':00',
+                END: aEnd + ':00'
+            }
+        };
+    }
+
+    /**
+     * Analyzes raw time punches against predefined shift schedules.
+     * Applies a basic duplicate removal rule (keeps the earliest punch in close clusters).
+     *
+     * @param {string[]} rawPunches - An array of time strings (e.g., ['07:18:08', '12:30:10', ...]).
+     * @returns {object} An object containing the structured shift analysis results.
+     */
+    function analyzePunches(rawPunches) {
+        if (rawPunches[8] == ";") {
+            rawPunches = rawPunches.split(";");
+
+        } else {
+            rawPunches = rawPunches.split(",");
+
+        }
+
+        // 1. Get Shift Rules from the UI
+        const SHIFTS = getShiftSettings();
+
+        // Helper functions (omitted for brevity, assume they are available)
+        const timeToSeconds = (timeStr) => {
+            const [h, m, s] = timeStr.split(':').map(Number);
+            return h * 3600 + m * 60 + s;
+        };
+        const secondsToHms = (totalSeconds) => {
+            const h = Math.floor(totalSeconds / 3600);
+            const m = Math.floor((totalSeconds % 3600) / 60);
+            const s = totalSeconds % 60;
+            return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+        };
+        const getTimeDiffMinutes = (timeA, timeB) => {
+            const diffSeconds = Math.abs(timeToSeconds(timeA) - timeToSeconds(timeB));
+            return parseFloat((diffSeconds / 60).toFixed(2));
+        };
+
+        // --- 2. Data Cleaning and Sorting ---
+        const sortedPunches = rawPunches.sort();
+        const cleanedPunches = [];
+        if (sortedPunches.length > 0) {
+            cleanedPunches.push(sortedPunches[0]);
+            for (let i = 1; i < sortedPunches.length; i++) {
+                const lastCleanTime = timeToSeconds(cleanedPunches[cleanedPunches.length - 1]);
+                const currentRawTime = timeToSeconds(sortedPunches[i]);
+                // Remove punches within 30 seconds of the previous accepted punch
+                if (currentRawTime - lastCleanTime > 30) {
+                    cleanedPunches.push(sortedPunches[i]);
+                }
+            }
+        }
+
+        // --- 3. Shift Matching (REVISED LOGIC) ---
+
+        // a. Morning Punches (Punches up to the Morning End time)
+        const mPunches = cleanedPunches.filter(p => timeToSeconds(p) <= timeToSeconds(SHIFTS.MORNING.END) + 3600);
+        // Allowing 1 hour past end for flexibility, but we only take the first two
+
+        let morningIn = mPunches.length > 0 ? mPunches[0] : null;
+        let morningOut = mPunches.length > 1 ? mPunches[1] : null;
+
+        // b. Afternoon Punches (Punches from a reasonable break-end time onwards)
+        // We start searching for A_IN from the M_OUT punch onwards.
+
+        let afternoonIn = null;
+        let afternoonOut = null;
+
+        // Find the first punch after the morning shift ends (or the last punch if no M_OUT)
+        const searchStartTime = morningOut ? timeToSeconds(morningOut) : timeToSeconds(SHIFTS.MORNING.END);
+
+        // Filter punches that occur after M_OUT
+        const aPunches = cleanedPunches.filter(p => timeToSeconds(p) > searchStartTime);
+
+        if (aPunches.length > 0) {
+            // The first punch after M_OUT is the Afternoon IN
+            afternoonIn = aPunches[0];
+
+            // The last punch is the Afternoon OUT (after cleaning, the last remaining punch is the final out)
+            afternoonOut = cleanedPunches[cleanedPunches.length - 1];
+
+            // Handle case where A_IN and A_OUT are the same punch (i.e. only one punch left)
+            if (afternoonIn === afternoonOut && aPunches.length > 1) {
+                afternoonOut = aPunches[aPunches.length - 1];
+            } else if (afternoonIn === afternoonOut && aPunches.length === 1) {
+                // If only one punch remains, it's just the IN, OUT is null
+                afternoonOut = null;
+            }
+        }
+
+        // --- 4. Calculate Metrics --- (Simplified for this response)
+
+        const results = {};
+
+        // ... (Morning Calculation Logic here - unchanged) ...
+
+        if (morningIn && morningOut) {
+            const mInSec = timeToSeconds(morningIn);
+            const mOutSec = timeToSeconds(morningOut);
+            const mLateThreshSec = timeToSeconds(SHIFTS.MORNING.LATE_THRESHOLD);
+            const mEndSec = timeToSeconds(SHIFTS.MORNING.END);
+
+            results.morningIn = morningIn;
+            results.noonOut = morningOut;
+            results.morningLateMin = mInSec > mLateThreshSec ? getTimeDiffMinutes(morningIn, SHIFTS.MORNING.LATE_THRESHOLD) : 0.00;
+            results.earlyNoonOutMin = mOutSec < mEndSec ? getTimeDiffMinutes(morningOut, SHIFTS.MORNING.END) : 0.00;
+            results.morningShiftSeconds = mOutSec - mInSec;
+            results.morningShiftHours = secondsToHms(results.morningShiftSeconds);
+        } else {
+            results.morningIn = results.noonOut = results.morningShiftHours = '0';
+            results.morningLateMin = results.earlyNoonOutMin = 0.00;
+            results.morningShiftSeconds = 0;
+        }
+
+        // ... (Afternoon Calculation Logic here) ...
+
+        if (afternoonIn && afternoonOut) {
+            const aInSec = timeToSeconds(afternoonIn);
+            const aOutSec = timeToSeconds(afternoonOut);
+            const aLateThreshSec = timeToSeconds(SHIFTS.AFTERNOON.LATE_THRESHOLD);
+            const aEndSec = timeToSeconds(SHIFTS.AFTERNOON.END);
+
+            results.afternoonIn = afternoonIn;
+            results.eveningOut = afternoonOut;
+
+            // Note: Lateness is still calculated against the 16:15 threshold
+            results.afternoonLateMin = aInSec > aLateThreshSec ? getTimeDiffMinutes(afternoonIn, SHIFTS.AFTERNOON.LATE_THRESHOLD) : 0.00;
+            results.earlyEveningOutMin = aOutSec < aEndSec ? getTimeDiffMinutes(afternoonOut, SHIFTS.AFTERNOON.END) : 0.00;
+
+            results.afternoonShiftSeconds = aOutSec - aInSec;
+            results.afternoonShiftHours = secondsToHms(results.afternoonShiftSeconds);
+        } else {
+            results.afternoonIn = results.eveningOut = results.afternoonShiftHours = '0';
+            results.afternoonLateMin = results.earlyEveningOutMin = 0.00;
+            results.afternoonShiftSeconds = 0;
+        }
+
+        // ... (Total Calculation Logic here) ...
+
+        results.totalSeconds = results.morningShiftSeconds + results.afternoonShiftSeconds;
+        results.totalHours = secondsToHms(results.totalSeconds);
+
+        delete results.morningShiftSeconds;
+        delete results.afternoonShiftSeconds;
+        delete results.totalSeconds;
+
+        return results;
+    }
+
+    /**
+     * Fixes: Restore HH:MM:SS format (was Hh Mm in your provided code).
+     */
+    function calculateTotalDecimalHoursFromStrings(timeStr1, timeStr2) {
+        // helper: convert "HH:MM:SS" to total seconds
+        function toSeconds(timeStr) {
+            if (!timeStr) return 0;
+            // Handles "H:M:S" or "H:M"
+            let [h, m, s] = (timeStr || "0:0:0").split(":").map(Number);
+            return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
+        }
+
+        // convert both to seconds
+        let totalSeconds = toSeconds(timeStr1) + toSeconds(timeStr2);
+
+        // convert back to HH:MM:SS
+        const h = Math.floor(totalSeconds / 3600);
+        const m = Math.floor((totalSeconds % 3600) / 60);
+        const s = totalSeconds % 60;
+
+        return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    }
+
+    /**
+     * Converts an Excel serial date number or Date object to a YYYY-MM-DD string.
+     */
+    function convertExcelDate(dateValue) {
+        // If it's a JS Date object (from XLSX.read with cellDates: true)
+        if (dateValue instanceof Date) {
+            const year = dateValue.getFullYear();
+            const month = String(dateValue.getMonth() + 1).padStart(2, '0');
+            const day = String(dateValue.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        }
+
+        // If it's an Excel serial number
+        if (typeof dateValue === 'number') {
+            const utc_days = Math.floor(dateValue - 25569);
+            const utc_value = utc_days * 86400;
+            const date_info = new Date(utc_value * 1000);
+            const date = new Date(date_info.getTime() + (date_info.getTimezoneOffset() * 60000));
+
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+
+            return `${year}-${month}-${day}`;
+        }
+
+        return dateValue;
+    }
+
+    /**
+     * Fixes: Restore HH:MM:SS format (was H:MM in your provided code).
+     */
+    function calculateShiftHours(morningInStr, noonOutStr) {
+        // Helper function to convert HH:MM:SS string to total seconds since midnight
+        function timeToSeconds(timeStr) {
+            if (!timeStr) return 0;
+            const parts = timeStr.split(':').map(Number);
+            // [H, M, S] -> H * 3600 + M * 60 + S
+            return (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+        }
+
+        const noonOutSeconds = timeToSeconds(noonOutStr);
+        const morningInSeconds = timeToSeconds(morningInStr);
+
+        // Calculate the difference in seconds.
+        const diffSeconds = Math.max(0, noonOutSeconds - morningInSeconds);
+
+        // Convert total seconds difference back to HH:MM:SS
+        const hours = Math.floor(diffSeconds / 3600);
+        const minutes = Math.floor((diffSeconds % 3600) / 60);
+        const seconds = diffSeconds % 60; // Get the remaining seconds
+
+        // Format with leading zeros
+        return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
+
+    function diffInMinutes(h1, h2) {
+
+        const date1 = new Date(`1970-01-01T${h1}Z`);
+        const date2 = new Date(`1970-01-01T${h2}Z`);
+        // Calculate the difference in milliseconds
+        const diffInMs = date2 - date1;
+
+        // Convert the difference to minutes
+        var diffInMinutes0 = diffInMs / (1000 * 60);
+        if (diffInMinutes0 <= 0 || undefined || NaN) {
+            return 0;
+        }
+        else {
+            return Math.round(diffInMinutes0 * 100) / 100;
+        }
+    }
+    /**
+     * Pivots the comma-separated time string into the four required columns.
+     * This logic assumes punches are IN/OUT/IN/OUT for a full day.
+     * @param {string} timeString - The comma-separated time string from the CSV/XLSX.
+     * @returns {object} An object with morningIn, noonOut, afternoonIn, eveningOut.
+     */
+    function pivotTime(timeString) {
+        var punches = getShiftPunches(timeString);
+        // MODIFICATION: Split using a comma (,)
+        //const punches = (timeString || "").split(',').filter(t => t.trim() !== '');
+
+        // Sort chronologically to correctly identify IN/OUT order
+        // Note: Lexicographical sort works for HH:MM:SS format
+        // punches.sort();
+
+        var morninglate = diffInMinutes(punches[0], '07:15:00');
+
+        var EarlyNoonOut = diffInMinutes(punches[1], '12:30:00');
+
+        var afternoonlate = diffInMinutes(punches[2], '16:00:00');
+
+        var EarlyEveningOut = diffInMinutes(punches[punches.length - 1], '19:30:00');
+
+        const morningShiftHours = calculateShiftHours(punches[0], punches[1]);
+        const afternoonShiftHours = calculateShiftHours(punches[2], punches[punches.length - 1]);
+        const TWHDay = calculateTotalDecimalHoursFromStrings(morningShiftHours, afternoonShiftHours);
+
+
+
+        // Map to the PDF's structure:
+        return {
+            morningIn: punches[0] || "",// 1st punch
+            morninglate: morninglate,
+            noonOut: punches[1] || "",          // 2nd punch
+            EarlyNoonOut: EarlyNoonOut = (isNaN(EarlyNoonOut) || EarlyNoonOut === undefined) ? 0 : EarlyNoonOut,
+            MorningShiftHours: morningShiftHours,
+            afternoonIn: punches[2] || "",// 3rd punch
+            afternoonlate: afternoonlate,
+            EarlyEveningOut: EarlyEveningOut,
+            eveningOut: punches[punches.length - 1] || "", // Last punch
+            afternoonShiftHours: afternoonShiftHours,
+            TWHDay: TWHDay,
+        };
+    }
+
+    /**
+     * Handles file upload and processing for both CSV and XLSX.
+     */
+    function handleFile(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = function (e) {
+            const data = e.target.result;
+            try {
+                // Set cellDates: true to help with date parsing
+                const workbook = XLSX.read(data, { type: 'binary', cellDates: true });
+                const sheetName = workbook.SheetNames[0];
+                const worksheet = workbook.Sheets[sheetName];
+
+                // MODIFICATION: Use { header: 1 } to correctly grab the 2nd row (index 1) as the header, skipping the first junk row.
+                const rawData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+
+
+                const summaryData = processData(rawData);
+                buildTable(summaryData);
+
+            } catch (error) {
+                console.error("Error processing file:", error);
+                alert("Could not process the file. Please ensure it is a valid CSV/XLSX file with a header on the second row.");
+            }
+        };
+        // Use readAsArrayBuffer for better XLSX support
+        reader.readAsBinaryString(file);
+    }
+
+    /**
+     * Processes raw data: fixes dates and pivots the time column.
+     */
+    /**
+     * Processes raw data: determines separator, fixes dates, and pivots the time column.
+     */
+    function processData(rawData) {
+        // 1. Determine the separator (Only needs to happen once on the first valid time entry)
+        const firstTimeEntry = rawData.find(row => row.Time)?.Time;
+        if (typeof firstTimeEntry === 'string') {
+            if (firstTimeEntry.includes(';')) {
+                timeSeparator = ';';
+            } else if (firstTimeEntry.includes(',')) {
+                timeSeparator = ',';
+            } else {
+                // If it's a single time entry, we leave the separator as comma or simply let pivotTime handle it.
+                // We keep it at the global default (comma)
+                timeSeparator = ',';
+            }
+        }
+
+        if (rawData[0][0] === "Time Card") {
+            rawData.splice(0, 1);
+        }
+        if (rawData[0][0] === "Employee ID") {
+            rawData.splice(0, 1);
+        }
+
+
+
+
+        const summaryRows = [];
+
+        for (const row of rawData) {
+            // Use the column headers from your file
+            const ID = row[0] || "";
+            const name = row[1] || "";
+            const dept = row[2] || "";
+            const date = convertExcelDate(row[3]);
+            const timeString = row[5];
+
+            const times = analyzePunches(timeString);
+
+            // Only add a row if we have a name and a date
+            if (name && date) {
+                summaryRows.push({
+                    ID: ID,
+                    name: name,
+                    dept: dept,
+                    date: date,
+                    morningIn: times.morningIn,
+                    morninglate: times.morningLateMin,
+                    noonOut: times.noonOut,
+                    EarlyNoonOut: times.earlyNoonOutMin,
+                    MorningShiftHours: times.morningShiftHours,
+                    afternoonIn: times.afternoonIn,
+                    afternoonlate: times.afternoonLateMin,
+                    eveningOut: times.eveningOut,
+                    EarlyEveningOut: times.earlyEveningOutMin,
+                    afternoonShiftHours: times.afternoonShiftHours,
+                    TWHDay: times.totalHours,
+                    punches: timeString
+                });
+            }
+        }
+        return summaryRows;
+    }
+
+    /**
+     * Replaces the dropdown with a text input for manual time entry.
+     * @param {HTMLElement} clickedCell - The table cell to insert the input into.
+     */
+    function createManualEntryInput(clickedCell) {
+        const originalValue = clickedCell.textContent.trim();
+        clickedCell.innerHTML = ''; // Clear the dropdown
+
+        const input = document.createElement('input');
+        input.type = 'text'; // Use text for HH:MM:SS format flexibility
+        input.value = originalValue !== '0' ? originalValue : '';
+        input.placeholder = 'HH:MM:SS (e.g., 07:15:00)';
+
+        // Apply some basic styling for visibility
+        input.style.width = '100px';
+        input.style.boxSizing = 'border-box';
+        input.style.border = '1px solid #007bff';
+
+        // Function to handle the input submission
+        const commitManualEntry = () => {
+            let newValue = input.value.trim();
+
+            // Simple validation: ensure it looks like time (H:M or H:M:S)
+            if (!newValue.match(/^\d{1,2}:\d{2}(:\d{2})?$/)) {
+                // If invalid, revert to the original value or '0'
+                newValue = originalValue;
+                alert("Invalid time format. Please use HH:MM:SS or HH:MM.");
+            } else {
+                // Pad HH:MM to HH:MM:SS if needed (e.g., "7:30" -> "07:30:00")
+                if (newValue.split(':').length === 2) {
+                    const parts = newValue.split(':');
+                    // Ensure hours is two digits and append seconds
+                    newValue = `${parts[0].padStart(2, '0')}:${parts[1]}:00`;
+                }
+                 // Ensure hours is two digits if seconds are present (e.g. "7:30:00" -> "07:30:00")
+                 if (newValue.split(':').length === 3) {
+                     const [h, m, s] = newValue.split(':');
+                     newValue = `${h.padStart(2, '0')}:${m}:${s}`;
+                 }
+
+                // Update the cell
+                clickedCell.textContent = newValue;
+
+                // Recalculate the row
+                const row = clickedCell.closest('tr');
+                if (row) {
+                    recalculateRow(row);
+                }
+            }
+
+            // Remove the input and display the text
+            clickedCell.innerHTML = newValue;
+        };
+
+        // Commit on blur (clicking away)
+        input.onblur = commitManualEntry;
+
+        // Commit on 'Enter' key press
+        input.onkeydown = (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                commitManualEntry();
+            }
+        };
+
+        clickedCell.appendChild(input);
+        input.focus();
+    }
+
+
+    /**
+     * Creates and inserts a <select> dropdown into the clicked table cell.
+     * MODIFIED to include MANUAL_ENTRY_PUNCH option.
+     */
+    function createDropdown(clickedCell) {
+        const row = clickedCell.closest('tr');
+        if (!row) return;
+
+        const dataAttribute = row.getAttribute('data');
+        if (!dataAttribute) return;
+
+        // Filter out empty strings from the punch data
+        const options = dataAttribute.split(',').map(time => time.trim()).filter(time => time !== '');
+
+        // Get the current cell value to pre-select it
+        const originalValue = clickedCell.textContent.trim();
+
+        // Ensure the original value is an option, especially if it's '0' or a time not in the punches list
+        if (originalValue && !options.includes(originalValue)) {
+            options.unshift(originalValue);
+        }
+
+        // --- MODIFICATION: Add Manual Entry Option ---
+        options.push("MANUAL_ENTRY_PUNCH");
+
+        // If only '0' and 'MANUAL_ENTRY_PUNCH' exist, stop.
+        if (options.length <= 1 && originalValue === '0') return;
+
+        const select = document.createElement('select');
+        select.className = 'time-dropdown';
+
+        // Handle selection change
+        select.onchange = function () {
+            const newValue = this.value;
+
+            if (newValue === "MANUAL_ENTRY_PUNCH") {
+                // --- MODIFICATION: Call new function for manual input ---
+                createManualEntryInput(clickedCell);
+            } else {
+                // Standard selection: update and recalculate
+                clickedCell.textContent = newValue;
+
+                // Get the parent row of the cell that was clicked
+                const row = clickedCell.closest('tr');
+                if (row) {
+                    // Call the existing function to recalculate all metrics for this row
+                    recalculateRow(row);
+                }
+
+                // Remove the dropdown and revert the cell content back to text
+                removeDropdown(clickedCell, this);
+            }
+        };
+
+        // Handle blur (clicking away) to revert to text if no selection was made
+        select.onblur = function () {
+            // Only revert if the select element is still the child of the cell
+            if (clickedCell.contains(this)) {
+                removeDropdown(clickedCell, this);
+            }
+        };
+
+        // Populate the Dropdown
+        options.forEach(time => {
+            const option = document.createElement('option');
+            option.value = time;
+
+            if (time === "MANUAL_ENTRY_PUNCH") {
+                option.textContent = "Manual Entry...";
+            } else {
+                option.textContent = time;
+            }
+
+            if (time === originalValue) {
+                option.selected = true;
+            }
+            select.appendChild(option);
+        });
+
+        clickedCell.innerHTML = ''; // Clear existing content
+        clickedCell.appendChild(select);
+        select.focus();
+    }
+
+    /**
+     * Builds the final HTML table and attaches the interactive dropdown listeners.
+     */
+    function buildTable(summaryData) {
+        const table = document.getElementById('summaryTable');
+        table.innerHTML = ""; // Clear existing content
+
+        if (summaryData.length === 0) {
+            table.innerHTML = "<tr><td>No data found in file.</td></tr>";
+            return;
+        }
+
+        // --- Create Table Header (No change needed here) ---
+        const thead = table.createTHead();
+        const headerRow = thead.insertRow();
+        const headers = ["Employee ID", "Name", "Department", "Date", "Morning In", "Morning Late (min)", "Noon Out", "Early Noon Out", "Morning Shift Hours", "Afternoon In", "Afternoon Late (min)", "Evening Out", "Early Evening Out", "Afternoon Shift Hours", "Total Hours"];
+
+        headers.forEach(text => {
+            const th = document.createElement('th');
+            th.textContent = text;
+            headerRow.appendChild(th);
+        });
+
+        // --- Create Table Body (MODIFIED TO ADD data-field) ---
+        const tbody = table.createTBody();
+        for (const row of summaryData) {
+            const tr = tbody.insertRow();
+
+            // Prepare punches data and set 'data' attribute
+            let punchesArray = [];
+            if (row.punches && typeof row.punches === 'string') {
+                 // Split using ; or , based on detection
+                 punchesArray = row.punches.split(row.punches.includes(';') ? ';' : ',');
+            }
+
+            // Add unique ID for potential local data update (future proofing)
+            tr.setAttribute('data-employee-id', row.ID);
+            tr.setAttribute('data', punchesArray.join(','));
+
+            tr.insertCell().textContent = row.ID;
+            tr.insertCell().textContent = row.name;
+            tr.insertCell().textContent = row.dept;
+            tr.insertCell().textContent = row.date;
+
+            // Morning In (Index 4) - ADD 'time-entry' and 'data-field'
+            tr.insertCell().textContent = row.morningIn;
+            tr.lastElementChild.classList.add('time-entry');
+            tr.lastElementChild.setAttribute('data-field', 'morningIn');
+
+            tr.insertCell().textContent = row.morninglate;
+
+            // Noon Out (Index 6) - ADD 'time-entry' and 'data-field'
+            tr.insertCell().textContent = row.noonOut;
+            tr.lastElementChild.classList.add('time-entry');
+            tr.lastElementChild.setAttribute('data-field', 'noonOut');
+
+            tr.insertCell().textContent = row.EarlyNoonOut;
+            tr.insertCell().textContent = row.MorningShiftHours;
+
+            // Afternoon In (Index 9) - ADD 'time-entry' and 'data-field'
+            tr.insertCell().textContent = row.afternoonIn;
+            tr.lastElementChild.classList.add('time-entry');
+            tr.lastElementChild.setAttribute('data-field', 'afternoonIn');
+
+            tr.insertCell().textContent = row.afternoonlate;
+
+            // Evening Out (Index 11) - ADD 'time-entry' and 'data-field'
+            tr.insertCell().textContent = row.eveningOut;
+            tr.lastElementChild.classList.add('time-entry');
+            tr.lastElementChild.setAttribute('data-field', 'eveningOut');
+
+            tr.insertCell().textContent = row.EarlyEveningOut;
+            tr.insertCell().textContent = row.afternoonShiftHours;
+            tr.insertCell().textContent = row.TWHDay;
+        }
+
+        // 2. Attach the dropdown logic after the table is created
+        attachDropdownListeners();
+    }
+    /**
+     * Reverts the table cell from containing a dropdown back to containing just text.
+     */
+    function removeDropdown(cell, selectElement) {
+        // If the dropdown is still in the cell, remove it and set the text content
+        if (cell.contains(selectElement)) {
+            // Use the currently selected value before removing the element
+            const finalValue = selectElement.value;
+            cell.innerHTML = finalValue;
+        }
+    }
+
+    /**
+     * Attaches the click listener using event delegation to the table.
+     * MODIFIED to check for existing input field.
+     */
+    function attachDropdownListeners() {
+        // Use the ID of your table container
+        const table = document.getElementById('summaryTable');
+
+        if (table) {
+            // Event delegation: listen on the parent table
+            table.addEventListener('click', function (event) {
+                // Check if the click target is one of the designated cells
+                const clickedCell = event.target.closest('td.time-entry');
+
+                if (clickedCell) {
+                    // --- MODIFICATION: Check for both select and input ---
+                    if (!clickedCell.querySelector('select') && !clickedCell.querySelector('input')) {
+                        createDropdown(clickedCell);
+                    }
+                }
+            });
+        }
+    }
+
+    function recalculateRow(tr) {
+        // 1. Get the current shift settings from the UI
+        const SHIFTS = getShiftSettings();
+
+        // 2. Extract the current IN/OUT values from the table cells
+        const cells = tr.querySelectorAll('td');
+
+        // Map the column index to the field name for easy access
+        const fieldMap = {
+            'Morning In': 4,
+            'Noon Out': 6,
+            'Afternoon In': 9,
+            'Evening Out': 11,
+        };
+
+        const morningInStr = cells[fieldMap['Morning In']].textContent.trim();
+        const noonOutStr = cells[fieldMap['Noon Out']].textContent.trim();
+        const afternoonInStr = cells[fieldMap['Afternoon In']].textContent.trim();
+        const eveningOutStr = cells[fieldMap['Evening Out']].textContent.trim();
+
+        // 3. Perform calculations using existing helper functions
+
+        // --- Morning Shift Calculations ---
+        const morningShiftHours = calculateShiftHours(morningInStr, noonOutStr);
+
+        // Late/Early Minutes (using SHIFTS object)
+        const morningLate = morningInStr !== '0' ? Math.max(0, diffInMinutes(SHIFTS.MORNING.LATE_THRESHOLD, morningInStr)) : 0;
+        const earlyNoonOut = noonOutStr !== '0' ? Math.max(0, diffInMinutes(noonOutStr, SHIFTS.MORNING.END)) : 0;
+
+        // --- Afternoon Shift Calculations ---
+        const afternoonShiftHours = calculateShiftHours(afternoonInStr, eveningOutStr);
+
+        // Late/Early Minutes (using SHIFTS object)
+        const afternoonLate = afternoonInStr !== '0' ? Math.max(0, diffInMinutes(SHIFTS.AFTERNOON.LATE_THRESHOLD, afternoonInStr)) : 0;
+        const earlyEveningOut = eveningOutStr !== '0' ? Math.max(0, diffInMinutes(eveningOutStr, SHIFTS.AFTERNOON.END)) : 0;
+
+        // --- Total Hours ---
+        const totalHours = calculateTotalDecimalHoursFromStrings(morningShiftHours, afternoonShiftHours);
+
+
+        // 4. Update the table cells (based on their fixed index)
+
+        cells[5].textContent = morningLate.toFixed(2);       // Morning Late (min)
+        cells[7].textContent = earlyNoonOut.toFixed(2);      // Early Noon Out
+        cells[8].textContent = morningShiftHours;            // Morning Shift Hours
+
+        cells[10].textContent = afternoonLate.toFixed(2);    // Afternoon Late (min)
+        cells[12].textContent = earlyEveningOut.toFixed(2);  // Early Evening Out
+        cells[13].textContent = afternoonShiftHours;         // Afternoon Shift Hours
+
+        cells[14].textContent = totalHours;                  // Total Hours
+    }
+</script>
+    <script>
+        // This runs after the whole page has loaded
+        document.addEventListener('DOMContentLoaded', (event) => {
+
+            // Function to re-run calculations on ALL visible rows
+            function reCalculateAllRows() {
+                console.log("Shift times changed, recalculating all rows...");
+                const allRows = document.querySelectorAll('#summaryTable tbody tr');
+                allRows.forEach(row => {
+                    // Check if it's a valid data row (not a "no data" message)
+                    if (row.querySelector('td')) {
+                        recalculateRow(row);
+                    }
+                });
+            }
+
+            // Attach this function to the 'change' event of all new shift inputs
+            document.getElementById('morningLateThreshold').addEventListener('change', reCalculateAllRows);
+            document.getElementById('morningEnd').addEventListener('change', reCalculateAllRows);
+            document.getElementById('afternoonLateThreshold').addEventListener('change', reCalculateAllRows);
+            document.getElementById('afternoonEnd').addEventListener('change', reCalculateAllRows);
+        });
+    </script>
+</body>
+
+</html>
